@@ -328,6 +328,33 @@ namespace Scriban
         }
 
         /// <summary>
+        /// Returns <c>true</c> if <see cref="ToObject"/> would be able to convert a value of
+        /// type <paramref name="fromType"/> to <paramref name="toType"/>, mirroring the same
+        /// conversion rules without requiring an actual value. Can be overridden alongside
+        /// <see cref="ToObject"/>.
+        /// </summary>
+        /// <param name="fromType">The source type.</param>
+        /// <param name="toType">The destination type.</param>
+        public virtual bool CanConvertTo(Type fromType, Type toType)
+        {
+            if (fromType is null) throw new ArgumentNullException(nameof(fromType));
+            if (toType is null) throw new ArgumentNullException(nameof(toType));
+            fromType = Nullable.GetUnderlyingType(fromType) ?? fromType;
+            toType = Nullable.GetUnderlyingType(toType) ?? toType;
+            if (fromType == toType) return true;
+            if (toType == typeof(string)) return true;  // ObjectToString always succeeds
+            if (toType == typeof(int)) return true;     // ToInt handles all types
+            if (toType == typeof(bool)) return true;    // ToBool handles all types
+            if (toType.IsEnum) return true;             // Enum.ToObject / Enum.Parse
+            if (fromType.IsPrimitiveOrDecimal() && toType.IsPrimitiveOrDecimal()) return true;
+            if (toType == typeof(IList)) return true;   // ToList
+            if (toType.IsAssignableFrom(fromType)) return true;
+            if (typeof(IScriptConvertibleTo).IsAssignableFrom(fromType)) return true;
+            if (typeof(IScriptConvertibleFrom).IsAssignableFrom(toType)) return true;
+            return false;
+        }
+
+        /// <summary>
         /// Called when trying to convert an object to a destination type. Can be overriden.
         /// </summary>
         /// <param name="span">The span requiring this conversion</param>

@@ -6,7 +6,10 @@
 
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using System.IO;
 using System.Numerics;
 using Scriban.Helpers;
@@ -131,10 +134,6 @@ namespace Scriban.Syntax
                             {
                                 return negate ? -((BigInteger)value) : value;
                             }
-                            else
-                            {
-                                throw new ScriptRuntimeException(span, $"Unexpected value `{value} / Type: {context.GetTypeName(value)}`. Cannot negate(-)/positive(+) a non-numeric value");
-                            }
                         }
                     }
                     break;
@@ -144,9 +143,57 @@ namespace Scriban.Syntax
                 }
             }
 
+            if (value != null && TryEvaluateWithCSharpOperator(context, span, value, op, out var csharpResult))
+            {
+                return csharpResult;
+            }
             throw new ScriptRuntimeException(span, $"Operator `{op.ToText()}` is not supported");
         }
 
+
+        private static readonly ConcurrentDictionary<(Type, ScriptUnaryOperator), MethodInfo?> UnaryOpMethodCache
+            = new ConcurrentDictionary<(Type, ScriptUnaryOperator), MethodInfo?>();
+
+        private static string? GetUnaryOperatorMethodName(ScriptUnaryOperator op) => op switch
+        {
+            ScriptUnaryOperator.Negate => "op_UnaryNegation",
+            ScriptUnaryOperator.Plus   => "op_UnaryPlus",
+            ScriptUnaryOperator.Not    => "op_LogicalNot",
+            _                          => null
+        };
+
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2070",
+            Justification = "C# operator overload discovery is intentional. In trimmed/AOT builds this fallback simply finds nothing and is skipped.")]
+        private static MethodInfo? FindUnaryOperatorMethod(TemplateContext context, Type type, string methodName)
+        {
+            foreach (var m in type.GetMethods(BindingFlags.Public | BindingFlags.Static))
+            {
+                if (m.Name != methodName) continue;
+                var parms = m.GetParameters();
+                if (parms.Length == 1 && context.CanConvertTo(type, parms[0].ParameterType))
+                    return m;
+            }
+            return null;
+        }
+
+        private static bool TryEvaluateWithCSharpOperator(TemplateContext context, SourceSpan span, object value, ScriptUnaryOperator op, out object? result)
+        {
+            var methodName = GetUnaryOperatorMethodName(op);
+            if (methodName == null) { result = null; return false; }
+
+            var type = value.GetType();
+            var method = UnaryOpMethodCache.GetOrAdd((type, op), key =>
+            {
+                var (t, oper) = key;
+                var name = GetUnaryOperatorMethodName(oper)!;
+                return FindUnaryOperatorMethod(context, t, name);
+            });
+
+            if (method == null) { result = null; return false; }
+            var parms = method.GetParameters();
+            result = method.Invoke(null, new object?[] { context.ToObject(span, value, parms[0].ParameterType) });
+            return true;
+        }
 
         public static ScriptUnaryExpression Wrap(ScriptUnaryOperator unaryOperator, ScriptToken unaryToken, ScriptExpression expression, bool transferTrivia)
         {

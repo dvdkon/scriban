@@ -6,6 +6,8 @@
 
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Collections.Generic;
 using System.Globalization;
@@ -232,6 +234,10 @@ namespace Scriban.Syntax
                                 return result;
                             }
                             break;
+                        }
+                        else if (TryEvaluateWithCSharpOperator(context, span, leftValue, rightValue, op, out var csharpResult))
+                        {
+                            return csharpResult;
                         }
                         else
                         {
@@ -654,7 +660,7 @@ namespace Scriban.Syntax
                 var leftInt = context.ToObject<int>(span, leftValue);
                 return CalculateInt(context, op, span, leftInt, (int)rightValue);
             }
-            
+
             if (leftType == typeof(bool))
             {
                 var rightBool = context.ToObject<bool>(span, rightValue);
@@ -1079,6 +1085,82 @@ namespace Scriban.Syntax
                     return left != right;
             }
             throw new ScriptRuntimeException(span, $"The operator `{op.ToText()}` is not valid for bool<->bool");
+        }
+
+        private static readonly ConcurrentDictionary<(Type, Type, ScriptBinaryOperator), MethodInfo?> BinaryOpMethodCache
+            = new ConcurrentDictionary<(Type, Type, ScriptBinaryOperator), MethodInfo?>();
+
+        private static string? GetBinaryOperatorMethodName(ScriptBinaryOperator op) => op switch
+        {
+            ScriptBinaryOperator.Add                   => "op_Addition",
+            ScriptBinaryOperator.Subtract              => "op_Subtraction",
+            ScriptBinaryOperator.Multiply              => "op_Multiply",
+            ScriptBinaryOperator.Divide                => "op_Division",
+            ScriptBinaryOperator.Modulus               => "op_Modulus",
+            ScriptBinaryOperator.CompareEqual          => "op_Equality",
+            ScriptBinaryOperator.CompareNotEqual       => "op_Inequality",
+            ScriptBinaryOperator.CompareGreater        => "op_GreaterThan",
+            ScriptBinaryOperator.CompareLess           => "op_LessThan",
+            ScriptBinaryOperator.CompareGreaterOrEqual => "op_GreaterThanOrEqual",
+            ScriptBinaryOperator.CompareLessOrEqual    => "op_LessThanOrEqual",
+            ScriptBinaryOperator.BinaryAnd             => "op_BitwiseAnd",
+            ScriptBinaryOperator.BinaryOr              => "op_BitwiseOr",
+            ScriptBinaryOperator.ShiftLeft             => "op_LeftShift",
+            ScriptBinaryOperator.ShiftRight            => "op_RightShift",
+            _                                          => null
+        };
+
+        private static bool TryEvaluateWithCSharpOperator(TemplateContext context, SourceSpan span, object leftValue, object rightValue, ScriptBinaryOperator op, out object? result)
+        {
+            var methodName = GetBinaryOperatorMethodName(op);
+            if (methodName == null) { result = null; return false; }
+
+            var leftType = leftValue.GetType();
+            var rightType = rightValue.GetType();
+
+            var method = BinaryOpMethodCache.GetOrAdd((leftType, rightType, op), key =>
+            {
+                var (lt, rt, oper) = key;
+                var name = GetBinaryOperatorMethodName(oper)!;
+                return FindBinaryOperatorMethod(context, lt, rt, name);
+            });
+
+            if (method == null) { result = null; return false; }
+            var parms = method.GetParameters();
+            result = method.Invoke(null, new object?[]
+            {
+                context.ToObject(span, leftValue, parms[0].ParameterType),
+                context.ToObject(span, rightValue, parms[1].ParameterType),
+            });
+            return true;
+        }
+
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2070",
+            Justification = "C# operator overload discovery is intentional. In trimmed/AOT builds this fallback simply finds nothing and is skipped.")]
+        private static MethodInfo? FindBinaryOperatorMethod(TemplateContext context, Type leftType, Type rightType, string methodName)
+        {
+            foreach (var m in leftType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+            {
+                if (m.Name != methodName) continue;
+                var parms = m.GetParameters();
+                if (parms.Length == 2
+                    && context.CanConvertTo(leftType, parms[0].ParameterType)
+                    && context.CanConvertTo(rightType, parms[1].ParameterType))
+                    return m;
+            }
+            if (leftType != rightType)
+            {
+                foreach (var m in rightType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (m.Name != methodName) continue;
+                    var parms = m.GetParameters();
+                    if (parms.Length == 2
+                        && context.CanConvertTo(leftType, parms[0].ParameterType)
+                        && context.CanConvertTo(rightType, parms[1].ParameterType))
+                        return m;
+                }
+            }
+            return null;
         }
     }
 }
